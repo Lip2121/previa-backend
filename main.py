@@ -62,7 +62,7 @@ def format_action_label_from_type(scenario_type: str | None) -> str:
     if scenario_type == "timing_adjustment":
         return "Adjusting cash timing"
     if scenario_type == "cash_injection":
-        return "Injecting cash"
+        return "Adding liquidity buffer"
     return "Scenario action"
 
 
