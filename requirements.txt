@@ -5,4 +5,5 @@ python-multipart
 apscheduler
 sendgrid
 pydantic
-numpy 
+numpy sqlalchemy
+psycopg2-binary
