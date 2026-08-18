@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from io import StringIO
+import csv
 import os
 import json
 import math
@@ -25,13 +26,65 @@ from sendgrid.helpers.mail import Mail
 # ------------------------------------------------------------
 
 def parse_uploaded_csv_bytes(content: bytes) -> pd.DataFrame:
-    try:
-        text = content.decode("utf-8-sig", errors="ignore")
-        df = pd.read_csv(StringIO(text))
-    except Exception as e:
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded CSV file is empty.")
+
+    decoded_text = None
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            decoded_text = content.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if decoded_text is None:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not read CSV file. Make sure the file is a valid CSV. Error: {str(e)}",
+            detail="Could not decode the CSV. Export it as UTF-8 CSV and try again.",
+        )
+
+    text_sample = decoded_text[:65536]
+    delimiters = [",", ";", "\t", "|"]
+    try:
+        sniffed = csv.Sniffer().sniff(text_sample, delimiters="".join(delimiters)).delimiter
+        delimiters = [sniffed] + [item for item in delimiters if item != sniffed]
+    except csv.Error:
+        pass
+
+    candidates = []
+    parse_errors = []
+    for delimiter in delimiters:
+        try:
+            candidate = pd.read_csv(
+                StringIO(decoded_text),
+                sep=delimiter,
+                engine="python",
+                dtype=str,
+                keep_default_na=False,
+                skipinitialspace=True,
+            )
+            candidate.columns = [str(column).strip().lstrip("\ufeff") for column in candidate.columns]
+            candidates.append(candidate)
+        except Exception as error:
+            parse_errors.append(str(error))
+
+    if not candidates:
+        detail = parse_errors[0] if parse_errors else "Unknown CSV formatting error"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read CSV file. Export it as CSV and try again. Error: {detail}",
+        )
+
+    # The correct separator is normally the candidate producing the most real columns.
+    df = max(candidates, key=lambda candidate: (len(candidate.columns), len(candidate.index)))
+
+    if len(df.columns) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Previa found only one column. Re-export the file as CSV using comma, "
+                "semicolon, or tab separators, then upload it again."
+            ),
         )
 
     if df.empty:
@@ -49,17 +102,17 @@ def normalize_expected_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         col_clean = str(col).strip().lower()
 
-        if col_clean in {"date", "dato", "transaction date", "posting date", "bogføringsdato", "bogfoeringsdato"}:
+        if col_clean in {"date", "dato", "transaction date", "posting date", "bogføringsdato", "bogfoeringsdato", "bilagsdato", "betalingsdato", "forfaldsdato"}:
             rename_map[col] = "date"
-        elif col_clean in {"amount", "beløb", "belob", "beloeb", "amount dkk", "value", "transaction amount"}:
+        elif col_clean in {"amount", "beløb", "belob", "beloeb", "amount dkk", "beløb dkk", "beloeb dkk", "value", "transaction amount", "saldoændring", "saldoaendring"}:
             rename_map[col] = "amount"
-        elif col_clean in {"customer", "kunde", "client"}:
+        elif col_clean in {"customer", "kunde", "client", "kundenavn"}:
             rename_map[col] = "customer"
-        elif col_clean in {"description", "tekst", "text", "message", "details", "posteringstekst"}:
+        elif col_clean in {"description", "tekst", "text", "message", "details", "posteringstekst", "beskrivelse", "bilagstekst", "notat"}:
             rename_map[col] = "description"
-        elif col_clean in {"category", "kategori", "type"}:
+        elif col_clean in {"category", "kategori", "type", "konto", "kontonavn", "kontonummer"}:
             rename_map[col] = "category"
-        elif col_clean in {"counterparty", "modpart", "merchant", "supplier", "vendor", "name"}:
+        elif col_clean in {"counterparty", "modpart", "merchant", "supplier", "vendor", "name", "leverandør", "leverandoer", "leverandørnavn", "leverandoernavn"}:
             rename_map[col] = "counterparty"
 
     return df.rename(columns=rename_map)
@@ -115,6 +168,53 @@ def validate_required_columns(df: pd.DataFrame):
             status_code=400,
             detail=f"Missing required column(s): {', '.join(missing)}. Your CSV must include at minimum 'date' and 'amount'.",
         )
+
+
+def parse_amount_series(series: pd.Series) -> pd.Series:
+    """Parse ordinary and Danish/European money strings into numeric values."""
+    def parse_value(value):
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return float("nan")
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        raw = str(value).strip()
+        if not raw:
+            return float("nan")
+
+        negative_parentheses = raw.startswith("(") and raw.endswith(")")
+        trailing_minus = raw.endswith("-")
+        cleaned = (
+            raw.replace("\u00a0", "")
+            .replace(" ", "")
+            .replace("DKK", "")
+            .replace("dkk", "")
+            .replace("kr.", "")
+            .replace("kr", "")
+            .replace("(", "")
+            .replace(")", "")
+            .rstrip("-")
+        )
+        cleaned = "".join(char for char in cleaned if char.isdigit() or char in ",.+-")
+
+        if "," in cleaned and "." in cleaned:
+            decimal_separator = "," if cleaned.rfind(",") > cleaned.rfind(".") else "."
+            thousands_separator = "." if decimal_separator == "," else ","
+            cleaned = cleaned.replace(thousands_separator, "").replace(decimal_separator, ".")
+        elif "," in cleaned:
+            parts = cleaned.split(",")
+            cleaned = "".join(parts) if len(parts[-1]) == 3 else "".join(parts[:-1]) + "." + parts[-1]
+        elif cleaned.count(".") > 1:
+            parts = cleaned.split(".")
+            cleaned = "".join(parts) if len(parts[-1]) == 3 else "".join(parts[:-1]) + "." + parts[-1]
+
+        try:
+            number = float(cleaned)
+            return -abs(number) if negative_parentheses or trailing_minus else number
+        except ValueError:
+            return float("nan")
+
+    return series.map(parse_value)
 
 
 # ------------------------------------------------------------
@@ -353,8 +453,8 @@ def build_transaction_intelligence(
         }
 
     work = df.copy()
-    work["date"] = pd.to_datetime(work["date"], errors="coerce")
-    work["amount"] = pd.to_numeric(work["amount"], errors="coerce")
+    work["date"] = pd.to_datetime(work["date"], errors="coerce", dayfirst=True)
+    work["amount"] = parse_amount_series(work["amount"])
     work = work.dropna(subset=["date", "amount"]).copy()
 
     if work.empty:
@@ -1499,8 +1599,8 @@ def forecast_cash(
     if "date" not in df.columns or "amount" not in df.columns:
         return {"error": "Expected columns: 'date' and 'amount'."}
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    df["amount"] = parse_amount_series(df["amount"])
     df = df.dropna(subset=["date", "amount"]).copy()
 
     if df.empty:
@@ -2651,7 +2751,7 @@ def quality_check(data: list[dict]):
     amount_col = "amount" if "amount" in df.columns else None
 
     if amount_col:
-        amounts = pd.to_numeric(df[amount_col], errors="coerce")
+        amounts = parse_amount_series(df[amount_col])
         bad_amounts = int(amounts.isna().sum())
 
         if bad_amounts > 0:
